@@ -114,14 +114,20 @@ def main(args, resume_preempt=False):
     normalize_predictor = cfgs_model.get("normalize_predictor", False)
     modality_embedding = cfgs_model.get("modality_embedding", False)
     levels_predictor = cfgs_model.get("levels_predictor", 4)
-    if model_name == "vit_large":
-        embed_dim_encoder = 1024
-    elif model_name == "vit_giant_xformers":
-        embed_dim_encoder = 1408
-    elif model_name == "vit_gigantic_xformers":
-        embed_dim_encoder = 1664
-    else:
-        print("Model name not recognized :(")
+    _embed_dim_table = {
+        "vit_tiny": 192,
+        "vit_small": 384,
+        "vit_base": 768,
+        "vit_large": 1024,
+        "vit_huge": 1280,
+        "vit_giant": 1408,
+        "vit_giant_xformers": 1408,
+        "vit_gigantic": 1664,
+        "vit_gigantic_xformers": 1664,
+    }
+    if model_name not in _embed_dim_table:
+        raise ValueError(f"Unknown model_name {model_name}")
+    embed_dim_encoder = _embed_dim_table[model_name]
 
     # -- DATA
     cfgs_data = args.get("data")
