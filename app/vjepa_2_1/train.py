@@ -28,6 +28,7 @@ from app.vjepa_2_1.utils import (
     init_opt,
     init_video_model,
     load_checkpoint,
+    load_teacher,
     normalize_nested,
 )
 from src.datasets.data_manager import init_data
@@ -128,6 +129,14 @@ def main(args, resume_preempt=False):
     if model_name not in _embed_dim_table:
         raise ValueError(f"Unknown model_name {model_name}")
     embed_dim_encoder = _embed_dim_table[model_name]
+    # Teacher distillation: replace EMA target with frozen pretrained teacher;
+    # keep student_ema as export-only model (not in loss); predictor projects to teacher dim.
+    cfgs_teacher = args.get("teacher") or {}
+    teacher_enabled = cfgs_teacher.get("enabled", False)
+    teacher_embed_dim = _embed_dim_table[cfgs_teacher["model_name"]] if teacher_enabled else None
+    target_dim = teacher_embed_dim if teacher_enabled else embed_dim_encoder
+    if teacher_enabled and levels_predictor != 1:
+        raise ValueError("Distillation from teacher uses model.levels_predictor: 1")
 
     # -- DATA
     cfgs_data = args.get("data")
@@ -363,8 +372,32 @@ def main(args, resume_preempt=False):
         has_cls_first=has_cls_first,
         interpolate_rope=interpolate_rope,
         modality_embedding=modality_embedding,
+        teacher_embed_dim=teacher_embed_dim,
+        n_output_distillation=levels_predictor,
     )
-    target_encoder = copy.deepcopy(encoder)
+    if teacher_enabled:
+        target_encoder = load_teacher(
+            device=device,
+            model_name=cfgs_teacher["model_name"],
+            ckpt_path=cfgs_teacher["ckpt_path"],
+            state_key=cfgs_teacher.get("state_key", "target_encoder"),
+            patch_size=patch_size,
+            max_num_frames=max_num_frames,
+            tubelet_size=model_tubelet_size,
+            crop_size=crop_size,
+            use_rope=use_rope,
+            interpolate_rope=interpolate_rope,
+            modality_embedding=modality_embedding,
+            has_cls_first=has_cls_first,
+            n_registers=n_registers,
+            img_temporal_dim_size=img_temporal_dim_size,
+            use_sdpa=use_sdpa,
+            uniform_power=uniform_power,
+        )
+        student_ema = copy.deepcopy(encoder)
+    else:
+        target_encoder = copy.deepcopy(encoder)
+        student_ema = None
 
     if compile_model:
         logger.info("Compiling encoder, target_encoder, and predictor.")
@@ -446,9 +479,13 @@ def main(args, resume_preempt=False):
     predictor = DistributedDataParallel(
         predictor, static_graph=False, find_unused_parameters=True
     )
-    target_encoder = DistributedDataParallel(target_encoder)
+    if not teacher_enabled:
+        target_encoder = DistributedDataParallel(target_encoder)
     for p in target_encoder.parameters():
         p.requires_grad = False
+    if teacher_enabled:
+        for p in student_ema.parameters():
+            p.requires_grad = False
 
     # -- momentum schedule
     momentum_scheduler = (
@@ -461,10 +498,11 @@ def main(args, resume_preempt=False):
     # -- load training checkpoint
     print("Loadind checkpoint from: ", load_path)
     if load_model or os.path.exists(latest_path):
+        loaded_target_encoder = None if teacher_enabled else target_encoder
         (
             encoder,
             predictor,
-            target_encoder,
+            loaded_target_encoder,
             optimizer,
             scaler,
             start_epoch,
@@ -472,11 +510,14 @@ def main(args, resume_preempt=False):
             r_path=load_path,
             encoder=encoder,
             predictor=predictor,
-            target_encoder=target_encoder,
+            target_encoder=loaded_target_encoder,
             opt=optimizer,
             scaler=scaler,
             is_anneal=is_anneal and not resume_anneal,
+            student_ema=student_ema,
         )
+        if not teacher_enabled:
+            target_encoder = loaded_target_encoder
         if not is_anneal or resume_anneal:
             for _ in range(start_epoch * ipe):
                 scheduler.step()
@@ -492,13 +533,15 @@ def main(args, resume_preempt=False):
             "predictor": predictor.state_dict(),
             "opt": optimizer.state_dict(),
             "scaler": None if scaler is None else scaler.state_dict(),
-            "target_encoder": target_encoder.state_dict(),
             "epoch": epoch,
             "loss": loss_meter.avg,
             "batch_size": batch_size,
             "world_size": world_size,
             "lr": lr,
         }
+        # Skip external frozen teacher state. Save student_ema (export model) in its place.
+        key, model = ("ema_encoder", student_ema) if teacher_enabled else ("target_encoder", target_encoder)
+        save_dict[key] = model.state_dict()
         try:
             torch.save(save_dict, path)
         except Exception as e:
@@ -594,7 +637,7 @@ def main(args, resume_preempt=False):
                 _new_lr = scheduler.step()
                 _new_wd = wd_scheduler.step()
 
-                def forward_target(c, embed_dim=embed_dim_encoder):
+                def forward_target(c, embed_dim=target_dim):
                     with torch.no_grad():
                         h = target_encoder(c, gram_mode=False, training_mode=True)
                         new_h = []
@@ -616,7 +659,7 @@ def main(args, resume_preempt=False):
                                 new_h.append(F.layer_norm(hi, (hi.size(-1),)))
                         return new_h
 
-                def forward_context(clips, embed_dim=embed_dim_encoder):
+                def forward_context(clips, embed_dim=target_dim):
                     modality = "video"
                     if img_temporal_dim_size is not None:
                         if clips[0].shape[2] == img_temporal_dim_size:
@@ -739,16 +782,14 @@ def main(args, resume_preempt=False):
                         optimizer.step()
                 optimizer.zero_grad()
 
-                # Step 3. momentum update of target encoder
+                # Step 3. EMA momentum update.
+                # teacher_enabled -> updates student_ema (export only; not in loss).
+                # else            -> updates target_encoder (self-distill target).
                 m = min(next(momentum_scheduler), ema[1])
+                ema_target = student_ema if teacher_enabled else target_encoder
                 with torch.no_grad():
-                    params_k = []
-                    params_q = []
-                    for param_q, param_k in zip(
-                        encoder.parameters(), target_encoder.parameters()
-                    ):
-                        params_k.append(param_k)
-                        params_q.append(param_q)
+                    params_q = list(encoder.parameters())
+                    params_k = list(ema_target.parameters())
                     torch._foreach_mul_(params_k, m)
                     torch._foreach_add_(params_k, params_q, alpha=1 - m)
 

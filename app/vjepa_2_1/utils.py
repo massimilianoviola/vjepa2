@@ -114,6 +114,7 @@ def load_checkpoint(
     opt,
     scaler,
     is_anneal=False,
+    student_ema=None,
 ):
     logger.info(f"Loading {r_path}")
     checkpoint = robust_checkpoint_loader(r_path, map_location=torch.device("cpu"))
@@ -161,6 +162,24 @@ def load_checkpoint(
             f"loaded pretrained target encoder from epoch {epoch} with msg: {msg}"
         )
 
+    ema_key = None
+    if "ema_encoder" in checkpoint:
+        ema_key = "ema_encoder"
+    elif "student_ema" in checkpoint:
+        ema_key = "student_ema"
+    if student_ema is not None and ema_key is not None:
+        pretrained_dict = checkpoint[ema_key]
+        for k, v in student_ema.state_dict().items():
+            if k not in pretrained_dict:
+                logger.info(f'key "{k}" could not be found in loaded state dict')
+            elif pretrained_dict[k].shape != v.shape:
+                logger.info(
+                    f'key "{k}" is of different shape in model and loaded state dict'
+                )
+                pretrained_dict[k] = v
+        msg = student_ema.load_state_dict(pretrained_dict, strict=False)
+        logger.info(f"loaded pretrained {ema_key} from epoch {epoch} with msg: {msg}")
+
     try:
         opt.load_state_dict(checkpoint["opt"])
     except ValueError:
@@ -179,6 +198,59 @@ def load_checkpoint(
         scaler,
         epoch,
     )
+
+
+def load_teacher(
+    device,
+    model_name,
+    ckpt_path,
+    state_key="target_encoder",
+    patch_size=16,
+    max_num_frames=16,
+    tubelet_size=2,
+    crop_size=256,
+    use_rope=True,
+    interpolate_rope=True,
+    modality_embedding=True,
+    has_cls_first=False,
+    n_registers=0,
+    img_temporal_dim_size=None,
+    use_sdpa=True,
+    uniform_power=True,
+):
+    teacher = video_vit.__dict__[model_name](
+        img_size=crop_size,
+        patch_size=patch_size,
+        num_frames=max_num_frames,
+        tubelet_size=tubelet_size,
+        uniform_power=uniform_power,
+        use_sdpa=use_sdpa,
+        use_rope=use_rope,
+        img_temporal_dim_size=img_temporal_dim_size,
+        n_registers=n_registers,
+        has_cls_first=has_cls_first,
+        interpolate_rope=interpolate_rope,
+        modality_embedding=modality_embedding,
+        n_output_distillation=1,
+    )
+    teacher = MultiSeqWrapper(teacher)
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state = ckpt[state_key]
+    new_state = {}
+    for k, v in state.items():
+        nk = k[len("module."):] if k.startswith("module.") else k
+        new_state[nk] = v
+    missing, unexpected = teacher.load_state_dict(new_state, strict=False)
+    logger.info(f"teacher load: missing={len(missing)} unexpected={len(unexpected)}")
+    if missing:
+        logger.info(f"first missing: {missing[:5]}")
+    if unexpected:
+        logger.info(f"first unexpected: {unexpected[:5]}")
+    teacher.to(device)
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad = False
+    return teacher
 
 
 def init_video_model(
@@ -212,6 +284,8 @@ def init_video_model(
     has_cls_first=False,
     interpolate_rope=False,
     modality_embedding=False,
+    teacher_embed_dim=None,
+    n_output_distillation=4,
 ):
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,
@@ -231,6 +305,7 @@ def init_video_model(
         has_cls_first=has_cls_first,
         interpolate_rope=interpolate_rope,
         modality_embedding=modality_embedding,
+        n_output_distillation=n_output_distillation,
     )
     encoder = MultiSeqWrapper(encoder)
     predictor = vit_pred.__dict__["vit_predictor"](
@@ -241,6 +316,8 @@ def init_video_model(
         tubelet_size=tubelet_size,
         embed_dim=encoder.backbone.embed_dim,
         predictor_embed_dim=pred_embed_dim,
+        out_embed_dim=teacher_embed_dim,
+        n_output_distillation=n_output_distillation,
         depth=pred_depth,
         num_heads=(
             encoder.backbone.num_heads if pred_num_heads is None else pred_num_heads
